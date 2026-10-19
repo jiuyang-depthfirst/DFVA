@@ -802,25 +802,33 @@ export async function registerRoutes(
     } catch (e: any) { res.status(500).json({ message: e.message }); }
   });
 
-  // 4. Path Traversal
-  // Requires auth. Prefix check looks for "logs/" at the start of the filename —
-  // looks like directory confinement, but path.join() does NOT strip the traversal
-  // segments before the file read, so "logs/../../etc/passwd" passes the check and
-  // resolves to /etc/passwd.
-  // Bypass: GET /api/files?filename=logs/../../etc/passwd
-  //         GET /api/files?filename=logs/../../proc/self/environ
+  // 4. Log file reads
   app.get(api.tools.readLog.path, requireAuth, (req, res) => {
-    const filename = req.query.filename as string;
-    if (!filename) return res.status(400).json({ message: "Filename required. Use: ?filename=logs/<name>" });
+    const filename = req.query.filename;
+    if (typeof filename !== "string" || !filename) return res.status(400).json({ message: "Filename required. Use: ?filename=logs/<name>" });
 
-    // "Restrict" access to the logs directory — prefix check only, no path resolution
     if (!filename.startsWith("logs/") && !filename.startsWith("./logs/")) {
       return res.status(403).json({ message: "Access denied: only files under logs/ are permitted." });
     }
 
+    const logsDir = path.resolve(process.cwd(), "logs");
+    const target = path.resolve(process.cwd(), filename);
+    const isWithinLogs = (directory: string, file: string) => {
+      const rel = path.relative(directory, file);
+      return rel !== "" && rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+    };
+    if (!isWithinLogs(logsDir, target)) {
+      return res.status(403).json({ message: "Access denied: only files under logs/ are permitted." });
+    }
+
     try {
-      const target = path.join(process.cwd(), filename); // VULN: traversal not resolved before check
-      res.json({ content: fs.readFileSync(target, "utf8"), resolvedPath: target });
+      // Resolve symlinks too, so an in-directory link cannot expose an outside file.
+      const realLogsDir = fs.realpathSync(logsDir);
+      const realTarget = fs.realpathSync(target);
+      if (!isWithinLogs(realLogsDir, realTarget)) {
+        return res.status(403).json({ message: "Access denied: only files under logs/ are permitted." });
+      }
+      res.json({ content: fs.readFileSync(realTarget, "utf8"), resolvedPath: target });
     } catch (e: any) { res.status(500).json({ message: "Error: " + e.message }); }
   });
 
