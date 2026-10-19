@@ -8,7 +8,27 @@ import {
   type Workspace, type WorkspaceMember, type WorkspaceInvitation,
   type KbArticle, type InsertKbArticle, type Coupon,
 } from "@shared/schema";
-import { eq, sql, ilike, lte, and, inArray, desc } from "drizzle-orm";
+import { eq, sql, ilike, lte, and, inArray, desc, gt } from "drizzle-orm";
+import { hashPassword, isPasswordHash } from "./passwords";
+
+// Run before accepting requests. An idempotent, conditional update allows multiple
+// instances to migrate the same legacy database without overwriting newer hashes.
+export async function migratePlaintextPasswords(): Promise<void> {
+  let lastId = 0;
+  while (true) {
+    const batch = await db.select({ id: users.id, password: users.password })
+      .from(users).where(gt(users.id, lastId)).orderBy(users.id).limit(100);
+    if (!batch.length) break;
+    for (const user of batch) {
+      if (!isPasswordHash(user.password)) {
+        const hashed = await hashPassword(user.password);
+        await db.update(users).set({ password: hashed })
+          .where(and(eq(users.id, user.id), eq(users.password, user.password)));
+      }
+    }
+    lastId = batch[batch.length - 1].id;
+  }
+}
 
 export interface IStorage {
   getUser(id: number): Promise<User | undefined>;
@@ -107,7 +127,8 @@ export class DatabaseStorage implements IStorage {
   }
 
   async createUser(insertUser: InsertUser): Promise<User> {
-    const [user] = await db.insert(users).values(insertUser).returning();
+    const password = await hashPassword(insertUser.password);
+    const [user] = await db.insert(users).values({ ...insertUser, password }).returning();
     return user;
   }
 

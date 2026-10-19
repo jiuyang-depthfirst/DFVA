@@ -1,6 +1,8 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
-import { storage } from "./storage";
+import { storage, migratePlaintextPasswords } from "./storage";
+import { hashPassword, verifyPassword } from "./passwords";
+import { initLoginThrottle, allowLoginAttempt } from "./loginThrottle";
 import { db } from "./db";
 import { walletTransactions, scanJobs } from "@shared/schema";
 import { eq, and } from "drizzle-orm";
@@ -194,6 +196,11 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
+  // Complete legacy credential migration and initialize shared throttling before
+  // the HTTP server starts accepting requests. Fail startup if either fails.
+  await migratePlaintextPasswords();
+  await initLoginThrottle();
+  const dummyPasswordHash = await hashPassword("invalid-account");
 
   // ── Seed on startup ──────────────────────────────────────────────────────────
   setTimeout(async () => {
@@ -474,26 +481,27 @@ export async function registerRoutes(
   });
 
   // ── AUTH ─────────────────────────────────────────────────────────────────────
-  // VULN: Plaintext password comparison (no hashing).
-  // VULN: User enumeration — distinct messages for "no such user" vs "wrong password".
-  // VULN: No rate limiting — unlimited brute-force attempts permitted.
   app.post("/api/auth/login", async (req, res) => {
     try {
-      const { username, password } = req.body;
-      if (!username || !password) return res.status(400).json({ message: "Username and password are required." });
+      const { username, password } = req.body ?? {};
+      if (typeof username !== "string" || !username || username.length > 256 ||
+          typeof password !== "string" || !password || password.length > 1024) {
+        return res.status(400).json({ message: "Invalid login credentials." });
+      }
+
+      // Do not trust X-Forwarded-For supplied by a client without a configured
+      // trusted proxy. req.ip uses Express's proxy trust configuration.
+      const ip = req.ip ?? req.socket.remoteAddress ?? "unknown";
+      if (!await allowLoginAttempt(ip, username)) {
+        return res.status(429).json({ message: "Too many login attempts. Please try again later." });
+      }
 
       const user = await storage.getUserByUsername(username);
-      const ip = (req.headers["x-forwarded-for"] as string)?.split(",")[0] ?? req.socket.remoteAddress ?? "unknown";
-
-      // VULN: Different messages reveal account existence
-      if (!user) {
-        logLogin({ userId: 0, username, fullName: null, plan: "unknown", ip, success: false, reason: "no_account" });
-        return res.status(401).json({ message: "No account found with that username." });
-      }
-      if (user.password !== password) {
-        // VULN: Full name logged even on failed attempt — PII exposure
-        logLogin({ userId: user.id, username, fullName: user.fullName, plan: user.plan, ip, success: false, reason: "wrong_password" });
-        return res.status(401).json({ message: "Incorrect password." });
+      // Spend the same password KDF work for unknown usernames as for real ones.
+      const valid = await verifyPassword(password, user?.password ?? dummyPasswordHash);
+      if (!user || !valid) {
+        logLogin({ userId: user?.id ?? 0, username, fullName: null, plan: "unknown", ip, success: false, reason: "invalid_credentials" });
+        return res.status(401).json({ message: "Invalid login credentials." });
       }
 
       // VULN: Full name (PII) written to server logs on every successful login
@@ -505,7 +513,10 @@ export async function registerRoutes(
       const token = signToken({ userId: user.id, username: user.username, role: user.role ?? "user", plan: user.plan });
 
       res.json({ id: user.id, username: user.username, plan: user.plan, walletBalance: user.walletBalance, role: user.role, fullName: user.fullName, token });
-    } catch (e: any) { res.status(500).json({ message: e.message }); }
+    } catch (e) {
+      console.error("Login failed:", e);
+      res.status(500).json({ message: "Login unavailable." });
+    }
   });
 
   app.post("/api/auth/logout", (_req, res) => {
@@ -608,8 +619,11 @@ export async function registerRoutes(
   //   → Same code can be used by unlimited sock accounts, each yielding $25 to the referrer.
   app.post("/api/auth/register", async (req, res) => {
     try {
-      const { username, password, email, fullName, referralCode } = req.body;
-      if (!username || !password) return res.status(400).json({ message: "username and password required" });
+      const { username, password, email, fullName, referralCode } = req.body ?? {};
+      if (typeof username !== "string" || !username || username.length > 256 ||
+          typeof password !== "string" || !password || password.length > 1024) {
+        return res.status(400).json({ message: "Invalid username or password." });
+      }
 
       const existing = await storage.getUserByUsername(username);
       if (existing) return res.status(409).json({ message: "Username already taken." });
